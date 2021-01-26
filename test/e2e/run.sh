@@ -450,7 +450,7 @@ launch() { # script API
     #                deploy cri-resmgr-webhook from the image on VM.
     #
     # Example:
-    #   cri_resmgr_cfg=/tmp/memtier.cfg launch cri-resmgr
+    #   cri_resmgr_cfg=/tmp/topology-aware.cfg launch cri-resmgr
     local target="$1"
     local launch_cmd
     local adjustment_schema="$HOST_PROJECT_DIR/pkg/apis/resmgr/v1alpha1/adjustment-schema.yaml"
@@ -805,6 +805,7 @@ create() { # script API
     local image
     local tag
     local errormsg
+    local default_name=${NAME:-""}
     if [ -z "$n" ]; then
         local n=1
     fi
@@ -818,7 +819,11 @@ create() { # script API
     fi
     for _ in $(seq 1 $n); do
         kind_count[$template_kind]=$(( ${kind_count[$template_kind]} + 1 ))
-        local NAME="${template_kind}$(( ${kind_count[$template_kind]} - 1 ))" # the first pod is pod0
+        if [ -n "$default_name" ]; then
+            local NAME="$default_name"
+        else
+            local NAME="${template_kind}$(( ${kind_count[$template_kind]} - 1 ))" # the first pod is pod0
+        fi
         eval "echo -e \"$(<"${template_file}")\"" | grep -v '^ *$' > "$OUTPUT_DIR/$NAME.yaml"
         host-command "$SCP \"$OUTPUT_DIR/$NAME.yaml\" $VM_SSH_USER@$VM_IP:" || {
             command-error "copying \"$OUTPUT_DIR/$NAME.yaml\" to VM failed"
@@ -832,11 +837,16 @@ create() { # script API
                 if [ "$image" = "IMAGE" ]; then
                     continue
                 fi
-                image="${image##*/}"
+                local notopdir_image="${image#*/}"
+                local norepo_image="${image##*/}"
                 if [ "$tag" = "latest" ]; then
                     pulled_images_on_vm+=("$image")
+                    pulled_images_on_vm+=("$notopdir_image")
+                    pulled_images_on_vm+=("$norepo_image")
                 fi
                 pulled_images_on_vm+=("$image:$tag")
+                pulled_images_on_vm+=("$notopdir_image:$tag")
+                pulled_images_on_vm+=("$norepo_image:$tag")
             done <<< "$COMMAND_OUTPUT"
         fi
         for image in $images; do
@@ -935,7 +945,7 @@ cri=${cri:=containerd}
 TOPOLOGY_DIR=${TOPOLOGY_DIR:=e2e}
 vm=${vm:=$(basename ${TOPOLOGY_DIR})-${distro}-${cri}}
 vm_files=${vm_files:-""}
-cri_resmgr_cfg=${cri_resmgr_cfg:-"${SCRIPT_DIR}/cri-resmgr-memtier.cfg"}
+cri_resmgr_cfg=${cri_resmgr_cfg:-"${SCRIPT_DIR}/cri-resmgr-topology-aware.cfg"}
 cri_resmgr_extra_args=${cri_resmgr_extra_args:-""}
 cri_resmgr_agent_extra_args=${cri_resmgr_agent_extra_args:-""}
 cleanup=${cleanup:-0}

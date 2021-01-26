@@ -82,6 +82,7 @@ type System interface {
 	CPUSet() cpuset.CPUSet
 	Package(id ID) CPUPackage
 	Node(id ID) Node
+	NodeDistance(from, to ID) int
 	CPU(id ID) CPU
 	Offlined() cpuset.CPUSet
 	Isolated() cpuset.CPUSet
@@ -124,6 +125,7 @@ type cpuPackage struct {
 type Node interface {
 	ID() ID
 	PackageID() ID
+	DieID() ID
 	CPUSet() cpuset.CPUSet
 	Distance() []int
 	DistanceFrom(id ID) int
@@ -136,6 +138,7 @@ type node struct {
 	path       string     // sysfs path
 	id         ID         // node id
 	pkg        ID         // package id
+	die        ID         // die id
 	cpus       IDSet      // cpus in this node
 	memoryType MemoryType // node memory type
 	normalMem  bool       // node has memory in a normal (kernel space allocatable) zone
@@ -152,6 +155,7 @@ type CPU interface {
 	ThreadCPUSet() cpuset.CPUSet
 	BaseFrequency() uint64
 	FrequencyRange() CPUFreq
+	EPP() EPP
 	Online() bool
 	Isolated() bool
 	SetFrequencyLimits(min, max uint64) error
@@ -167,6 +171,7 @@ type cpu struct {
 	threads  IDSet   // sibling/hyper-threads
 	baseFreq uint64  // CPU base frequency
 	freq     CPUFreq // CPU frequencies
+	epp      EPP     // Energy Performance Preference from cpufreq governor
 	online   bool    // whether this CPU is online
 	isolated bool    // whether this CPU is isolated
 }
@@ -177,6 +182,17 @@ type CPUFreq struct {
 	max uint64   // maximum frequency (kHz)
 	all []uint64 // discrete set of frequencies if applicable/known
 }
+
+// EPP represents the value of a CPU energy performance profile
+type EPP int
+
+const (
+	EPPPerformance EPP = iota
+	EPPBalancePerformance
+	EPPBalancePower
+	EPPPower
+	EPPUnknown
+)
 
 // MemInfo contains data read from a NUMA node meminfo file.
 type MemInfo struct {
@@ -269,6 +285,17 @@ func (sys *system) Discover(flags DiscoveryFlag) error {
 			for _, nodeID := range pkg.nodes.SortedMembers() {
 				if node, ok := sys.nodes[nodeID]; ok {
 					node.pkg = pkg.id
+				} else {
+					return sysfsError("NUMA nodes", "can't find NUMA node for ID %d", nodeID)
+				}
+			}
+			for _, dieID := range pkg.DieIDs() {
+				for _, nodeID := range pkg.DieNodeIDs(dieID) {
+					if node, ok := sys.nodes[nodeID]; ok {
+						node.die = dieID
+					} else {
+						return sysfsError("NUMA nodes", "can't find NUMA node for ID %d", nodeID)
+					}
 				}
 			}
 		}
@@ -290,6 +317,8 @@ func (sys *system) Discover(flags DiscoveryFlag) error {
 			sys.Debug("node #%d:", id)
 			sys.Debug("      cpus: %s", node.cpus)
 			sys.Debug("  distance: %v", node.distance)
+			sys.Debug("   package: #%d", node.pkg)
+			sys.Debug("       die: #%d", node.die)
 		}
 
 		for id, cpu := range sys.cpus {
@@ -301,6 +330,7 @@ func (sys *system) Discover(flags DiscoveryFlag) error {
 			sys.Debug("    threads: %s", cpu.threads)
 			sys.Debug("  base freq: %d", cpu.baseFreq)
 			sys.Debug("       freq: %d - %d", cpu.freq.min, cpu.freq.max)
+			sys.Debug("        epp: %d", cpu.epp)
 		}
 
 		sys.Debug("offline CPUs: %s", sys.offline)
@@ -472,6 +502,11 @@ func (sys *system) Node(id ID) Node {
 	return sys.nodes[id]
 }
 
+// NodeDistance gets the distance between two NUMA nodes.
+func (sys *system) NodeDistance(from, to ID) int {
+	return sys.nodes[from].DistanceFrom(to)
+}
+
 // CPU gets the CPU with a given CPU id.
 func (sys *system) CPU(id ID) CPU {
 	return sys.cpus[id]
@@ -544,6 +579,9 @@ func (sys *system) discoverCPU(path string) error {
 	if _, err := readSysfsEntry(path, "cpufreq/cpuinfo_max_freq", &cpu.freq.max); err != nil {
 		cpu.freq.max = 0
 	}
+	if _, err := readSysfsEntry(path, "cpufreq/energy_performance_preference", &cpu.epp); err != nil {
+		cpu.epp = EPPUnknown
+	}
 	if node, _ := filepath.Glob(filepath.Join(path, "node[0-9]*")); len(node) == 1 {
 		cpu.node = getEnumeratedID(node[0])
 	} else {
@@ -609,6 +647,11 @@ func (c *cpu) BaseFrequency() uint64 {
 // FrequencyRange returns the frequency range for this CPU.
 func (c *cpu) FrequencyRange() CPUFreq {
 	return c.freq
+}
+
+// EPP returns the energy performance profile of this CPU.
+func (c *cpu) EPP() EPP {
+	return c.epp
 }
 
 // Online returns if this CPU is online.
@@ -789,9 +832,14 @@ func (n *node) ID() ID {
 	return n.id
 }
 
-// PackageID returns the id of this node.
+// PackageID returns the package id for this node.
 func (n *node) PackageID() ID {
 	return n.pkg
+}
+
+// DieID returns the die id for this node.
+func (n *node) DieID() ID {
+	return n.die
 }
 
 // CPUSet returns the CPUSet for all cores/threads in this node.
@@ -994,4 +1042,38 @@ func (sys *system) discoverCache(path string) error {
 	sys.cache[c.id] = c
 
 	return nil
+}
+
+// eppStrings initialized this way to better catch changes in the enum
+var eppStrings = func() [EPPUnknown]string {
+	var e [EPPUnknown]string
+	e[EPPPerformance] = "performance"
+	e[EPPBalancePerformance] = "balance_performance"
+	e[EPPBalancePower] = "balance_power"
+	e[EPPPower] = "power"
+	return e
+}()
+
+var eppValues = func() map[string]EPP {
+	m := make(map[string]EPP, len(eppStrings))
+	for i, v := range eppStrings {
+		m[v] = EPP(i)
+	}
+	return m
+}()
+
+// String returns EPP value as string
+func (e EPP) String() string {
+	if int(e) < len(eppStrings) {
+		return eppStrings[e]
+	}
+	return ""
+}
+
+// EPPFromString converts string to EPP value
+func EPPFromString(s string) EPP {
+	if v, ok := eppValues[s]; ok {
+		return v
+	}
+	return EPPUnknown
 }
